@@ -1,0 +1,101 @@
+---
+title: "3nt Dengue Code"
+output: html_notebook
+---
+
+### Intialization and installation
+```{r, echo=F, eval=F, message=F}
+### Initialize packages
+library(rhdf5)
+library(dplyr)
+library(plyr)
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+library(parallel)
+library(Biostrings)
+library(Rsamtools)
+library(feather)
+library(data.table)
+library(GenomicAlignments)
+library(tidyverse)
+```
+
+```{r}
+### 3nt periodicity
+
+datasets <- c("RiboNSC1","RiboNSC2","RiboNSC3","RibosiP1","RibosiP2","RibosiP3",
+              "RNANSC1","RNANSC2","RNANSC3","RNAsiP1","RNAsiP2","RNAsiP3")
+filepath <- "/data/riboseq/Dengue/output/shah/"
+
+
+bcountData <- read_delim(paste0(filepath, "all_counts_bam.tsv"), 
+    "\t", escape_double = FALSE, trim_ws = TRUE)
+  
+gff <- readGFFAsGRanges("/data/riboseq/Supp/seqs/Virus/Dengue/human_dengue.gff3")
+
+genes <- as.character(bcountData$tid)
+dataset <- "data"
+out_data <- c()
+```
+
+```{r}
+get_nt_period <- function(fid,gene,dataset,left,right){
+  data_mat <- h5read(file = fid, paste0("/",gene,"/",dataset,"/reads/data"))  # Get the matrix of read counts
+  pos_sum <- colSums(data_mat)  # Position-specific sum of reads of all lengths
+  pos_sum <- pos_sum[left:(ncol(data_mat)-right)] # Ignore reads in parts of the buffer region defined by left/right
+  return(pos_sum)
+}
+
+n_buffer <- 25  # Number of nts in buffer to be included in the summary table/plot
+n_gene <- 50  # Number of nts in CDS to be included in the summary table/plot
+n_total <- n_buffer+n_gene
+
+# NOTE: Do not use mclapply when accessing H5 data
+
+# Get gene and position specific total counts of all lengths
+for(fn in datasets){
+  fid <- paste0(filepath,fn,".h5")
+
+  gene_sp_pos_counts <- mclapply(genes,function(gene){
+                              utr5 <- width(gff[gff$type=="UTR5" & gff$Name==gene])
+                              n_buffer_utr5 <- ifelse(utr5 >= n_buffer,n_buffer,0)
+                              utr3 <- width(gff[gff$type=="UTR3" & gff$Name==gene])
+                              n_buffer_utr3 <- ifelse(utr3 >= n_buffer,n_buffer,0)
+                              nt_period <- get_nt_period(fid=fid,
+                                                         gene=gene,
+                                                         dataset=dataset,
+                                                         left=(utr5-n_buffer_utr5)+1,
+                                                         right=utr3-n_buffer_utr3)
+
+                              c(rep(0,n_buffer-n_buffer_utr5),
+                                nt_period,
+                                rep(0,n_buffer-n_buffer_utr3))
+                        }, mc.cores = 40)
+  x <- lapply(gene_sp_pos_counts,head,n=n_total) # Subset reads mapping to a fixed region across genes (5')
+  y <- lapply(gene_sp_pos_counts,tail,n=n_total) # Subset reads mapping to a fixed region across genes (3')
+  a <- sapply(x,length)
+  x <- x[a==n_total]
+  y <- y[a==n_total]
+
+  lsum <- colSums(matrix(unlist(x),byrow=T,nrow=length(x))) # Position-specific sums of reads (5')
+  rsum <- colSums(matrix(unlist(y),byrow=T,nrow=length(x))) # Position-specific sums of reads (3')
+
+  # Create a dataframe to store the output for plots/analyses
+  out_data <- rbind(out_data, data.frame(Data = fn,
+                                        Pos = c((-n_buffer+1):n_gene, -n_gene:(n_buffer-1)),
+                                        Counts = c(lsum,rsum),
+                                        End = rep(c("5'","3'"),each=n_total)))
+  H5Fclose(fid)
+}
+```
+
+### Plots
+```{r}
+period_plot <- ggplot(out_data, aes(x=Pos, y=Counts, col=Data)) + geom_line() + facet_wrap(~End, scales="free") + scale_y_log10()
+
+ggsave(period_plot, filename = paste0(filepath,"periodicity_plot.png"), width=10, height=5)
+
+write_tsv(out_data, path=paste0(filepath,"periodicity_3n.tsv"))
+
+```
