@@ -3,9 +3,7 @@
 This repository contains the scripts and plots association with the following publication:
 
 Campos RK,Wijeratne HRS, Shah P, Garcia-Blanco MA, and Bradrick SS. (2019)
-
-*Ribosomal stalk proteins RPLP1 and RPLP2 promote biogenesis of flaviviral and cellular multi-passtransmembrane proteins.* 
-
+*Ribosomal stalk proteins RPLP1 and RPLP2 promote biogenesis of flaviviral and cellular multi-pass transmembrane proteins.* 
 **Nucl. Acids Res. 48 (17) 9872–9885.**
 
 
