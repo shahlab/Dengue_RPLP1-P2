@@ -1,0 +1,1261 @@
+---
+title: "Dengue RPLP1/P2 data analysis"
+output: html_notebook
+---
+
+### Load packages
+```{r}
+library(rtracklayer)
+library(GenomicAlignments)
+library(rhdf5)
+library(tidyverse)
+library(riborex)
+library(latex2exp)
+library(readxl)
+library(MASS)
+library(RcppRoll)
+library(ggpubr)
+library(ggforce)
+```
+
+### Set parameters
+```{r}
+# Number of cores available 
+num_cores <- 40
+datasets <- c("RiboNSC1","RiboNSC2","RiboNSC3","RibosiP1","RibosiP2","RibosiP3",
+              "RNANSC1","RNANSC2","RNANSC3","RNAsiP1","RNAsiP2","RNAsiP3")
+filepath <- "../../../output/"
+```
+
+### Read in annotations and GFF data
+```{r}
+# Read in Appris list
+appris <- read_tsv("../data/human_appris_data.principal.txt", col_names = F)
+
+# Get a list of all principal transcripts
+# Pick the first principal transcript in genes with multiple principal transcripts 
+all_enstt <- appris %>% 
+  filter(substr(X5,1,1)=="P") %>%
+  arrange(X1) %>%
+  filter(!duplicated(X1))
+
+# Read in GFF file
+gff <- readGFFAsGRanges("../data/human_dengue.gff3")
+
+# Combine annotation data with gene names
+countData <- gff %>% 
+  as_tibble() %>%
+  group_by(seqnames) %>%
+  summarise(Length = sum(width)) %>%
+  left_join(., gff %>% 
+              as_tibble() %>% 
+              filter(type == "CDS") %>% 
+              dplyr::select(seqnames, width)) %>%
+  dplyr::rename(CDSLength = width,
+                tid = seqnames) %>%
+  left_join(., all_enstt %>% 
+              dplyr::rename(gene = X1, tid = X3) %>% 
+              dplyr::select(gene, tid))
+
+countData$gene[countData$tid=="DENGUE"] <- "DENGUE"
+```
+
+### Read in count data from bamFile
+```{r}
+for(fn in datasets){
+  bamData <- readGAlignments(paste0(filepath, fn, ".bam")) # Read in bam data
+  bamData <- bamData %>%
+    as_tibble() %>%
+    filter(qwidth >= 10, qwidth <= 50, strand == "+") %>% # Filter read lengths and strand
+    group_by(seqnames) %>%
+    tally() %>% # Count reads mapping to each gene/transcript
+    dplyr::rename(tid = seqnames)
+  
+  countData <- left_join(countData, bamData, by = "tid")
+}
+colnames(countData)[5:16] <- datasets
+countData[is.na(countData)] <- 0
+
+# Calculate TPMS
+tpmData <- countData %>% 
+  mutate_at(vars(matches("Ribo")), list(~ ./CDSLength)) %>% 
+  mutate_at(vars(matches("RNA")), list(~ ./Length)) %>% 
+  mutate_at(vars(matches("R")), list(~ .*1e6/sum(.)))
+
+write_tsv(countData, "../data/all_counts.tsv")
+write_tsv(tpmData, "../data/all_tpms.tsv")
+```
+
+
+### 3nt periodicity (Fig. S2)
+```{r}
+transcripts <- countData %>% pull(tid)
+dataset <- "data" # Dummy name used in creating H5 files
+out_data <- c()
+
+get_nt_period <- function(fid, transcript, dataset, left, right){
+  data_mat <- h5read(fid, paste0("/", transcript, "/", dataset, "/reads/data"))  # Get the matrix of read counts
+  pos_sum <- colSums(data_mat)  # Position-specific sum of reads of all lengths
+  pos_sum <- pos_sum[left:(ncol(data_mat)-right)] # Ignore reads in parts of the buffer region defined by left/right
+  return(pos_sum)
+}
+
+n_buffer <- 25  # Number of nts in buffer to be included in the summary table/plot
+n_transcript <- 50  # Number of nts in CDS to be included in the summary table/plot
+n_total <- n_buffer + n_transcript
+
+# Get transcript and position specific total counts of all lengths
+for(fn in datasets){
+  fid <- paste0(filepath, fn, ".h5")
+
+  transcript_sp_pos_counts <- mclapply(transcripts, function(transcript){
+                              utr5 <- width(gff[gff$type == "UTR5" & gff$Name == transcript])
+                              n_buffer_utr5 <- ifelse(utr5 >= n_buffer, n_buffer, 0)
+                              utr3 <- width(gff[gff$type == "UTR3" & gff$Name == transcript])
+                              n_buffer_utr3 <- ifelse(utr3 >= n_buffer, n_buffer, 0)
+                              nt_period <- get_nt_period(fid = fid,
+                                                         transcript = transcript,
+                                                         dataset = dataset,
+                                                         left = (utr5-n_buffer_utr5)+1,
+                                                         right = utr3-n_buffer_utr3)
+                              c(rep(0, n_buffer-n_buffer_utr5),
+                                nt_period,
+                                rep(0, n_buffer-n_buffer_utr3))
+                              }, mc.cores = num_cores)
+  
+  trans5p <- sapply(transcript_sp_pos_counts, head, n = n_total) # Subset reads mapping to a fixed region across transcripts (5')
+  trans3p <- sapply(transcript_sp_pos_counts, tail, n = n_total) # Subset reads mapping to a fixed region across transcripts (3')
+  a <- sapply(trans5p, length)
+  trans5p <- trans5p[a == n_total]
+  trans3p <- trans3p[a == n_total]
+
+  trans5psum <- colSums(matrix(unlist(trans5p), byrow = T, nrow = length(trans5p))) # Position-specific sums of reads (5')
+  trans3psum <- colSums(matrix(unlist(trans3p), byrow = T, nrow = length(trans3p))) # Position-specific sums of reads (3')
+
+  # Create a dataframe to store the output for plots/analyses
+  out_data <- bind_rows(out_data, 
+                        tibble(Data = fn,
+                               Pos = c((-n_buffer+1):n_transcript, -n_transcript:(n_buffer-1)),
+                               Counts = c(trans5psum, trans3psum),
+                               End = rep(c("5'","3'"), each = n_total)))
+}
+
+periodData <- out_data %>% 
+  mutate(Type = str_sub(Data, 1, nchar(Data)-4), 
+         Rep = str_sub(Data, -4),
+         Q = str_sub(Rep, 1, 3),
+         End = factor(End, levels = c("5'", "3'")),
+         Q = factor(Q, levels = c("siP", "NSC")))
+
+figS2 <- ggplot(periodData, aes(x = Pos, y = Counts, col = Q, fill = Rep)) + 
+  geom_line() + 
+  facet_grid(Type~End, scales = "free_x") + 
+  scale_color_brewer(palette = "Set1") +
+  labs(x = "Nucleotide position relative to START/STOP codon", y = "Read counts") +
+  theme_bw() +
+  theme(legend.position="bottom",
+        legend.title = element_blank()) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                breaks = c(1000, 10000, 100000))
+figS2
+ggsave(figS2, filename = "../plots/FigS2.tiff", width=6, height=4, units="in", dpi=300, compression = "lzw")
+
+write_tsv(out_data, "../data/periodicity_3n.tsv")
+```
+
+## Dengue reads
+```{r}
+gene <- "DENGUE"
+dtype <- rep(c("RPF","mRNA"),each=6)
+etype <- rep(rep(c("NSC","siP"),each=3),2)
+names(dtype) <- datasets # Dataset type (RNA or Riboseq)
+names(etype) <- datasets # Experiment type (NSC or siP)
+
+dengue_pos_read <- c()
+for(fn in datasets){
+  fid <- paste0(filepath, fn, ".h5")
+  d <- colSums(h5read(fid,paste0("/",gene,"/data/reads/data"))) # Read in count data
+  dengue_pos_read <- bind_rows(dengue_pos_read, tibble(data = fn,
+                                                       pos = 1:length(d), # Nucleotide ositions
+                                                       counts = d,# Counts
+                                                       ncounts = d/mean(d), # Normalized counts 
+                                                       dtype = dtype[fn],
+                                                       etype = etype[fn]))
+}
+dengue_pos_read <- dengue_pos_read %>% 
+  mutate(etype = factor(etype, levels = c("siP", "NSC")))
+
+sum.dengue_pos_read <- dengue_pos_read %>% 
+  split(.$data) %>% # For each dataset
+  map(~mutate(., sum.ncounts = sum(ncounts), 
+         prob.ncounts = ncounts/sum.ncounts, # Fraction of counts at each position
+         cum.ncounts = cumsum(prob.ncounts))) %>% # Cumulative fraction
+  bind_rows() %>%
+  group_by(etype, dtype, pos) %>%
+  dplyr::summarise(mean.cum.ncounts = mean(cum.ncounts), # Mean of cumulative counts
+                   sd.cum.ncounts = sd(cum.ncounts)) # SD of cumulative counts
+```
+
+## RNA and Ribo counts around pause site (Fig. S3C)
+```{r}
+figS3C <- ggplot(sum.dengue_pos_read %>% filter(pos>400 & pos<1600), aes(x = pos, y = mean.cum.ncounts, col = etype)) +
+  geom_ribbon(aes(ymin = mean.cum.ncounts - sd.cum.ncounts, 
+                  ymax = mean.cum.ncounts + sd.cum.ncounts,
+                  fill = etype, col=NULL), alpha = 0.25) +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  facet_wrap(dtype~.) +
+  guides(col = FALSE) +
+  labs(x = "Nucleotide position", y = "Cumulative reads fraction") +
+  theme_pubr(legend = "bottom") +
+  theme(legend.title = element_blank())
+figS3C
+
+ggsave(figS3C, filename = "../plots/FigS3C.tiff", width=6, height=4, units="in", dpi=300, compression = "lzw")
+```
+
+## Position specific read counts (Fig. S4)
+```{r, fig.width = 6, fig.height = 14}
+rpf_pos_reads <- ggplot(dengue_pos_read %>% 
+                          filter(dtype=="RPF") %>% 
+                          mutate(xd = substr(data, nchar(data)-3, nchar(data))), aes(x = pos, y = ncounts)) +
+  geom_line() + 
+  facet_wrap(~xd, nrow = 6, scales="free") +
+  theme_pubr() +
+  labs(x = "Nucleotide position", y = "Normalized reads")
+rpf_pos_reads
+
+rna_pos_reads <- ggplot(dengue_pos_read %>% 
+                          filter(dtype=="mRNA") %>% 
+                          mutate(xd = substr(data, nchar(data)-3, nchar(data))), aes(x = pos, y = ncounts)) +
+  geom_line() + 
+  facet_wrap(~xd, nrow = 6, scales="free") +
+  theme_pubr() +
+  labs(x = "Nucleotide position", y = "Normalized reads")
+rna_pos_reads
+
+ggsave(rpf_pos_reads, filename = "../plots/FigS4A.tiff", width=6, height=14, units="in", dpi=300, compression = "lzw")
+ggsave(rna_pos_reads, filename = "../plots/FigS4B.tiff", width=6, height=14, units="in", dpi=300, compression = "lzw")
+
+```
+
+## Dengue gene-specific abundances (Fig. S3A)
+```{r}
+dengue_gene_pos <- read_tsv("../data/dengue.gene_pos", col_names = FALSE)
+dengue_gene_pos <- lapply(1:nrow(dengue_gene_pos), 
+                           function(x){
+                             tibble(gene = unlist(dengue_gene_pos[x,1]),
+                                    new_Pos = unlist(dengue_gene_pos[x,2]):unlist(dengue_gene_pos[x,3]))
+                           }) %>% bind_rows()
+
+gene <- "DENGUE"
+dtype <- rep(c("RPF","mRNA"),each=6)
+etype <- rep(rep(c("NSC","siP"),each=3),2)
+names(dtype) <- datasets # Dataset type (RNA or Riboseq)
+names(etype) <- datasets # Experiment type (NSC or siP)
+
+## RPF data
+dengue_pos_length_count <- c()
+for(fn in datasets[1:6]){
+  fid <- paste0(filepath, fn, ".h5")
+  d <- h5read(fid,paste0("/",gene,"/data/reads/data"))[20:26,] # Read in count data
+  dengue_pos_length_count <- bind_rows(dengue_pos_length_count, 
+                                       d %>%
+                                         as_tibble() %>%
+                                         mutate(dataset = fn,
+                                                data = etype[fn]))
+}
+offset_data <- dengue_pos_length_count %>% 
+  mutate(Length = rep(c(29:35), 6)) %>% 
+  pivot_longer(names_to = "Pos", cols = 1:(ncol(dengue_pos_length_count)-2)) %>%
+  mutate(Pos = as.integer(substr(Pos, 2, nchar(Pos)))) %>%
+  mutate(new_Pos = case_when(Length == 29 ~ Pos+15,
+                             Length == 30 ~ Pos+15,
+                             Length == 31 ~ Pos+16,
+                             Length == 32 ~ Pos+16,
+                             Length == 33 ~ Pos+16,
+                             Length == 34 ~ Pos+17,
+                             Length == 35 ~ Pos+17)) %>%
+  left_join(., dengue_gene_pos, by = "new_Pos")
+
+dengue_rpf <- offset_data %>%
+  group_by(gene, dataset) %>%
+  summarise(rpf.counts = sum(value)) %>%
+  ungroup() %>% 
+  mutate(rep = substr(dataset, nchar(dataset), nchar(dataset)),
+         data = substr(dataset, nchar(dataset)-3, nchar(dataset)-1)) %>%
+  select(-dataset)
+
+## RNA data
+dengue_pos_length_count <- c()
+for(fn in datasets[7:12]){
+  fid <- paste0(filepath, fn, ".h5")
+  d <- h5read(fid,paste0("/",gene,"/data/reads/data")) # Read in count data
+  dengue_pos_length_count <- bind_rows(dengue_pos_length_count, 
+                                       d %>%
+                                         as_tibble() %>%
+                                         mutate(dataset = fn,
+                                                data = etype[fn]))
+}
+offset_data <- dengue_pos_length_count %>% 
+  mutate(Length = rep(c(10:50), 6)) %>% 
+  pivot_longer(names_to = "Pos", cols = 1:(ncol(dengue_pos_length_count)-2)) %>%
+  mutate(Pos = as.integer(substr(Pos, 2, nchar(Pos)))) %>%
+  mutate(new_Pos = Length+Pos-1) %>%
+  left_join(., dengue_gene_pos, by = "new_Pos")
+
+dengue_rna <- offset_data %>%
+  group_by(gene, dataset) %>%
+  summarise(rna.counts = sum(value)) %>%
+  ungroup() %>% 
+  mutate(rep = substr(dataset, nchar(dataset), nchar(dataset)),
+         data = substr(dataset, nchar(dataset)-3, nchar(dataset)-1)) %>%
+  select(-dataset)
+
+dengue_te <- full_join(dengue_rpf, dengue_rna, by = c("gene", "rep", "data")) %>%
+  left_join(., dengue_gene_pos %>%
+              group_by(gene) %>%
+              tally(), 
+            by = "gene") %>%
+  left_join(., countData %>% 
+              select(5:16) %>% 
+              pivot_longer(1:12) %>% 
+              group_by(name) %>% 
+              summarise(total = sum(value)) %>% 
+              mutate(rep = substr(name, nchar(name), nchar(name)),
+                     data = substr(name, nchar(name)-3, nchar(name)-1),
+                     type = substr(name, 1, nchar(name)-4)) %>%
+              select(-name) %>%
+              pivot_wider(names_from = type, values_from = total),
+            by = c("data", "rep")) %>%
+  mutate(te = (rpf.counts/Ribo)/(rna.counts/RNA))
+
+dengue_te <- dengue_te %>% 
+  group_by(gene, data) %>%
+  summarise(TE = mean(te),
+            se = sd(te)/sqrt(3)) %>%
+  mutate(Dataset = data,
+         Gene = factor(gene, levels = dengue_gene_pos %>% 
+                         select(gene) %>% 
+                         distinct() %>% 
+                         pull(gene))) %>%
+  ungroup() %>%
+  filter(!is.na(gene))
+
+```
+
+```{r}
+figS3A <- ggplot(dengue_te, aes(x = Gene, y = TE, fill = Dataset)) + 
+  geom_bar(position = position_dodge(), stat="identity") +
+  geom_errorbar(aes(ymin = TE-se, ymax = TE+se),
+                width = .2,                    # Width of the error bars
+                position = position_dodge(.9)) + 
+  labs(y="Ribosome density", x = "") +
+  scale_fill_brewer(palette = "Set1", direction = -1) +
+  theme_pubr(legend = "bottom") +
+  theme(legend.title = element_blank()) 
+
+figS3A
+ggsave(figS3A, filename = "../plots/FigS3A.tiff", units="in", dpi=300, compression = "lzw", width=10, height=4)
+```
+
+## DESeq2 analysis
+```{r}
+cnts <- as.matrix(countData[, c("RiboNSC1", "RiboNSC2", "RiboNSC3", "RibosiP1", "RibosiP2", "RibosiP3")])
+rownames(cnts) <- countData$tid
+cond <- factor(rep(1:2, each = 3))
+
+# object construction
+dds <- DESeqDataSetFromMatrix(cnts, DataFrame(cond), ~ cond)
+
+# standard analysis
+dds <- DESeq(dds)
+res <- results(dds)
+
+# moderated log2 fold changes
+rpfFC <- lfcShrink(dds, coef = 2)
+rpfFC <- as.data.frame(rpfFC)
+rpfFC <- rpfFC %>% 
+  mutate(tid = rownames(rpfFC),
+         padj = p.adjust(pvalue, "BH")) %>% 
+  as_tibble()
+  
+cnts <- as.matrix(countData[, c("RNANSC1", "RNANSC2", "RNANSC3", "RNAsiP1", "RNAsiP2", "RNAsiP3")])
+rownames(cnts) <- countData$tid
+cond <- factor(rep(1:2, each = 3))
+
+# object construction
+dds <- DESeqDataSetFromMatrix(cnts, DataFrame(cond), ~ cond)
+
+# standard analysis
+dds <- DESeq(dds)
+res <- results(dds)
+
+# moderated log2 fold changes
+rnaFC <- lfcShrink(dds, coef = 2)
+rnaFC <- as.data.frame(rnaFC)
+rnaFC <- rnaFC %>% 
+  mutate(tid = rownames(rnaFC),
+         padj = p.adjust(pvalue, "BH")) %>% 
+  as_tibble()
+```
+
+## riborex analysis
+```{r}
+rnaRX <- as.matrix(countData[, c("RNANSC1", "RNANSC2", "RNANSC3", "RNAsiP1", "RNAsiP2", "RNAsiP3")])
+rownames(rnaRX) <- countData$tid
+rpfRX <- as.matrix(countData[, c("RiboNSC1", "RiboNSC2", "RiboNSC3", "RibosiP1", "RibosiP2", "RibosiP3")])
+rownames(rpfRX) <- countData$tid
+
+cond <- c("control", "control", "control", "treated", "treated", "treated")
+
+RX.deseq2 <- riborex(rnaRX, rpfRX, cond, cond)
+RX.deseq2 <- as.data.frame(RX.deseq2) %>% 
+  mutate(tid = rownames(RX.deseq2),
+         padj = p.adjust(pvalue, "BH")) %>% 
+  dplyr::rename(log2FoldChange.rx = log2FoldChange,
+         padj.rx = padj) %>%
+  as_tibble()
+```
+
+## Identify genes with differential expression
+```{r}
+meanTPM <- tpmData %>% 
+  mutate(RPF.NSC = (RiboNSC1 + RiboNSC2 + RiboNSC3)/3,
+         RPF.siP = (RibosiP1 + RibosiP2 + RibosiP3)/3,
+         RNA.NSC = (RNANSC1 + RNANSC2 + RNANSC3)/3,
+         RNA.siP = (RNAsiP1 + RNAsiP2 + RNAsiP3)/3) %>%
+  dplyr::select(tid, gene, Length, RPF.NSC, RPF.siP, RNA.NSC, RNA.siP) %>%
+  left_join(., rpfFC %>% 
+              dplyr::select(tid, log2FoldChange, padj), 
+            by = "tid") %>%
+  left_join(., rnaFC %>% 
+              dplyr::select(tid, log2FoldChange, padj), 
+            by = "tid", suffix = c(".rpf", ".rna")) %>% 
+  left_join(., RX.deseq2 %>% 
+              dplyr::select(tid, log2FoldChange.rx, padj.rx), by = "tid") %>%
+  mutate(te.NSC = RPF.NSC/RNA.NSC,
+         te.siP = RPF.siP/RNA.siP,
+         Color.rpf = "#525252", 
+         Color.rna = "#525252",
+         Color.fc = "No change",
+         Color.rx = "#525252")
+
+meanTPM$Color.rpf[meanTPM$padj.rpf < 0.01 & abs(meanTPM$log2FoldChange.rpf) > 1] <- "#e41a1c"
+meanTPM$Color.rna[meanTPM$padj.rna < 0.01 & abs(meanTPM$log2FoldChange.rna) > 1] <- "#e41a1c"
+meanTPM$Color.rx[meanTPM$padj.rx < 0.01 & abs(meanTPM$log2FoldChange.rx) > 1] <- "#e41a1c"
+meanTPM$Color.fc[meanTPM$padj.rna < 0.01 & abs(meanTPM$log2FoldChange.rna) > 1] <- "Transcription"
+meanTPM$Color.fc[meanTPM$padj.rpf < 0.01 & abs(meanTPM$log2FoldChange.rpf) > 1] <- "Translation"
+meanTPM$Color.fc[meanTPM$padj.rna < 0.01 & meanTPM$padj.rpf < 0.01 & abs(meanTPM$log2FoldChange.rna) > 1 & abs(meanTPM$log2FoldChange.rpf) > 1] <- "Both"
+
+meanTPM <- meanTPM %>% 
+  mutate(Color.fc = factor(Color.fc, levels = c("No change", "Transcription", "Translation", "Both")))
+
+write_tsv(meanTPM, "../data/TPM.w.foldchange.tsv")
+```
+
+```{r}
+rnaPlot <- ggplot(meanTPM %>% arrange(Color.rna), aes(x = RNA.NSC, y = RNA.siP, col = Color.rna)) +
+  geom_point(size = 0.5, alpha = 0.5) + 
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  coord_equal() +
+  scale_color_identity() +
+  guides(col = FALSE) +
+  labs(x = "NSC RNA TPM", y = "siP RNA TPM") +
+  stat_cor(aes(x = meanTPM$RNA.NSC, y = meanTPM$RNA.siP, label = ..rr.label..), inherit.aes = FALSE) +
+  theme_pubr()
+rnaPlot
+
+rpfPlot <- ggplot(meanTPM %>% arrange(Color.rpf), aes(x = RPF.NSC, y = RPF.siP, col = Color.rpf)) +
+  geom_point(size = 0.5, alpha = 0.5) + 
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  coord_equal() +
+  scale_color_identity() +
+  guides(col = FALSE) +
+  labs(x = "NSC RPF TPM", y = "siP RPF TPM") +
+  stat_cor(aes(x = meanTPM$RPF.NSC, y = meanTPM$RPF.siP, label = ..rr.label..), inherit.aes = FALSE) +
+  theme_pubr()
+rpfPlot
+
+tePlot <- ggplot(meanTPM %>% arrange(Color.rx), aes(x = te.NSC, y = te.siP, col = Color.rx)) +
+  geom_point(size = 0.5, alpha = 0.5) + 
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  coord_equal() +
+  scale_color_identity() +
+  guides(col = FALSE) +
+  labs(x = "Ribosome density NSC", y = "Ribosome density siP") +
+  stat_cor(aes(x = meanTPM$te.NSC, y = meanTPM$te.siP, label = ..rr.label..), inherit.aes = FALSE) +
+  theme_pubr()
+tePlot
+
+fcPlot <- ggplot(meanTPM, aes(x = log2FoldChange.rna, y = log2FoldChange.rpf, col = Color.fc)) +
+  geom_point(size = 0.8, alpha = 0.7) + 
+  coord_equal() +
+  scale_x_continuous(limits = c(-2,2.2)) +
+  scale_y_continuous(limits = c(-2,2.2)) +
+  scale_color_brewer(palette = "Dark2") +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  labs(x = TeX("RNA Log$_2$ Fold-change"), y = TeX("RPF Log$_2$ Fold-change")) +
+  stat_cor(aes(x = meanTPM$log2FoldChange.rna, y = meanTPM$log2FoldChange.rpf, label = ..rr.label..), inherit.aes = FALSE) +
+  theme_pubr() +
+  theme(legend.title = element_blank(),
+        legend.text=element_text(size=10),
+        legend.position = c(0.8, 0.2))
+fcPlot
+```
+
+```{r}
+fig5 <- ggarrange(rnaPlot, rpfPlot, fcPlot, nrow = 1, ncol = 3,
+                  labels = c("A", "B", "C"))
+fig5
+ggsave(fig5, filename = "../plots/Fig5.tiff", units="in", dpi=300, 
+       compression = "lzw", width = 12, height = 4)
+
+ggsave(tePlot, filename = "../plots/FigS6.tiff", units="in", dpi=300, 
+       compression = "lzw", width = 5, height = 5)
+```
+
+## Polarity scores analysis
+```{r}
+human_genes <- as.character(unique(seqnames(gff)))
+h5_genes <- paste0("/",human_genes,"/data/reads/data")
+
+start_pos <- start(gff[gff$type=="CDS"]) + 16
+stop_pos <- end(gff[gff$type=="CDS"]) -15
+
+polarity_data <- tibble()
+
+for(fn in datasets[1:6]){
+  fid <- paste0(filepath,fn,".h5")
+  
+  tmp <- mclapply(1:length(h5_genes), 
+                  function(x){
+                    s <- colSums(h5read(fid, h5_genes[x]))
+                    if(sum(s)>64){
+                      s <- s[start_pos[x]:stop_pos[x]]
+                      w <- (2*seq(length(s)) - (length(s)+1))/(length(s)-1)
+                      pol <- sum(s*w/sum(s))
+                    }else{
+                      pol <- NA
+                    }
+                    return(pol)
+                  }, mc.cores = 40)
+  polarity_data <- bind_rows(polarity_data, tibble(data = fn,
+                                                   gene = human_genes,
+                                                   pol = unlist(tmp)))
+}
+
+write_tsv(polarity_data, "../data/polarity_data.tsv")
+```
+
+```{r}
+polarity_data <- polarity_data %>% 
+  mutate(data = substr(data, 5, nchar(data)-1)) %>%
+  group_by(gene, data) %>%
+  dplyr::summarise(mean_pol = mean(pol, na.rm=T),
+            sd_pol = sd(pol, na.rm=T)) %>%
+  ungroup() %>%
+  mutate(data = factor(data, levels = c("siP", "NSC")))
+```
+
+## High coverage data
+```{r}
+high_cov <- countData %>% 
+  select(-c(2:4)) %>% 
+  pivot_longer(names_to = "data", cols = 2:13) %>%
+  mutate(type = substr(data, 1, nchar(data)-4)) %>%
+  group_by(tid, type) %>%
+  summarise(max = max(value)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = type, values_from = max) %>%
+  filter(Ribo >= 64 & RNA >= 64) %>%
+  select(tid)
+```
+
+
+```{r}
+polarity_plot1 <- ggplot(polarity_data %>% 
+                           filter(gene %in% high_cov$tid), 
+                         aes(x = mean_pol, fill = data)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(x = "Mean polarity score", y = "Density") +
+  annotate("text", x = 0, y = 2.5, label = TeX("Paired t-test $p\ < \ 2.2 x 10^{-16}$")) + 
+  theme_pubr(legend = "bottom") +
+  theme(legend.title = element_blank())
+polarity_plot1
+
+ggsave(polarity_plot1, filename = "../plots/FigS11A.tiff", units="in", dpi=300, compression = "lzw", width=10, height=5)
+
+```
+
+### Polarity with TM and other features
+```{r}
+gene_names_and_transmembrane_number <- read_excel("../data/gene_names_and_transmembrane_number.xls", sheet = "Sheet1")
+
+polarity_data <- polarity_data %>%
+  left_join(., countData %>% 
+              mutate(symbol = gene, gene = tid) %>% 
+              dplyr::select(symbol, gene), 
+            by = "gene") %>%
+  left_join(., gene_names_and_transmembrane_number %>%
+              mutate(symbol = `Gene symbol`, TM = `TMHMM TM`) %>%
+              dplyr::select(symbol, TM), 
+            by = "symbol") %>%
+  mutate(group = case_when(is.na(TM)|TM==0 ~ "No TMDs",
+                           TM >= 5 ~ ">= 5 TMDs",
+                           TM >= 2 ~ "2 - 4 TMDs",
+                           TM > 0 ~ "1 TMD")) %>%
+  mutate(group = factor(group, levels = c("No TMDs", "1 TMD", "2 - 4 TMDs", ">= 5 TMDs")))
+```
+
+
+```{r}
+TMpolarity_plot1 <- ggplot(polarity_data %>% 
+                             filter(gene %in% high_cov$tid), 
+                           aes(x = mean_pol, fill = data)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Set1", direction = -1) +
+  labs(x = "Mean polarity score", y = "Density") +
+  facet_grid(~group) +
+  theme_pubr(legend = "bottom") +
+  theme(legend.title = element_blank(),
+        strip.background = element_rect(colour="white", fill="white"))
+TMpolarity_plot1
+
+ggsave(TMpolarity_plot1, filename = "../plots/FigS12B.tiff", units="in", dpi=300, compression = "lzw", width=10, height=5)
+
+```
+
+### TM with fold change
+```{r}
+polarity_spread <- polarity_data %>%
+  pivot_wider(names_from = data, values_from = mean_pol) %>%
+  left_join(., meanTPM %>% 
+              mutate(symbol = gene,
+                     gene = tid) %>%
+              select(gene, log2FoldChange.rna, log2FoldChange.rpf, log2FoldChange.rx), 
+            by = "gene") %>% 
+  pivot_longer(names_to = "FC.type", values_to = "FC", cols = 7:9)
+```
+
+```{r}
+datalabels <- list('log2FoldChange.rna' = "RNA",
+                   'log2FoldChange.rpf' = "RPF")
+
+labeller <- function(variable,value){
+  return(datalabels[value])
+}
+
+TM.fc.plot <- ggplot(polarity_spread %>% 
+                       filter(FC.type != "log2FoldChange.rx"), 
+                     aes(x = FC, fill = group, col = group)) +
+  geom_density(alpha = 0.3) +
+  fill_palette(palette = "jco") +
+  ggpubr::color_palette(palette = "jco") +
+  labs(x = TeX("Log$_2$ Fold-change"),
+       y = "Density") +
+  facet_grid(~FC.type, labeller = labeller) +
+  theme_pubr() +
+  theme(legend.title = element_blank(),
+        legend.position = c(0.12, 0.78),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+TM.fc.plot
+
+ggsave(TM.fc.plot, filename = "../plots/Fig6C.tiff", units="in", dpi=300, compression = "lzw", width = 8, height = 5)
+```
+
+```{r}
+my_comparisons <- list(c("2 - 4 TMDs", ">= 5 TMDs"),
+                       c("1 TMD", "2 - 4 TMDs"),
+                       c("1 TMD", ">= 5 TMDs"),
+                       c("No TMDs", "1 TMD"),
+                       c("No TMDs", "2 - 4 TMDs"),
+                       c("No TMDs", ">= 5 TMDs"))
+
+TM.fc.plot2 <- ggplot(polarity_spread %>% 
+                        filter(FC.type!="log2FoldChange.rx"), 
+                      aes(x = group, y =  FC, fill = group, col = group)) +
+  geom_boxplot(alpha = 0.8) +
+  guides(color = F, fill = F) +
+  fill_palette(palette = "jco") +
+  ggpubr::color_palette(palette = "jco") +
+  labs(y = TeX("Log$_2$ Fold-change"),
+       x = "") +
+  facet_grid(~FC.type, labeller = labeller) +
+  stat_compare_means(comparisons = my_comparisons[4:6]) +
+  theme_pubr() +
+  theme(legend.title = element_blank(),
+        legend.position = c(0.12, 0.78),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+TM.fc.plot2
+
+ggsave(TM.fc.plot2, filename = "../plots/Fig6B.tiff", units="in", dpi=300, compression = "lzw", width = 10, height = 5)
+```
+## Analysis of ribosomal genes
+```{r}
+hs.ribo <- read_csv("../data/human.ribo.csv") 
+hs.ribo <- hs.ribo %>% 
+  dplyr::rename(gene = names(hs.ribo)[2])
+
+hs.tpm <- left_join(hs.ribo %>% dplyr::select(gene), meanTPM, "gene") %>% 
+  mutate(Color.gene = c(rep("Mitochondrial", 78), 
+                        rep("Small subunit", 34), 
+                        rep("Large subunit", 51))) %>%
+  mutate(Color.gene = factor(Color.gene, 
+                             levels = c("Small subunit", 
+                                        "Large subunit", "Mitochondrial")))
+```
+
+```{r}
+hs.tpm.p1 <- ggplot(hs.tpm, aes(x = te.NSC, y = te.siP, col = Color.gene)) +
+  geom_point(size = 1.2) + 
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  coord_equal() +
+  geom_abline(intercept = 0, slope = 1) +
+  ggpubr::color_palette(palette = "jco") +  
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  labs(x = "Ribosome density NSC", y = "Ribosome density siP") +
+  stat_cor(aes(x = te.NSC, y = te.siP, label = ..rr.label..), inherit.aes = FALSE) +
+  theme_pubr(legend = "right") +
+  theme(legend.title = element_blank(),
+        legend.text=element_text(size=10))
+hs.tpm.p1
+
+hs.tpm.p2 <- ggplot(hs.tpm, aes(x = log2FoldChange.rna, y = log2FoldChange.rpf, col = Color.gene)) +
+  geom_point(size = 1.2) + 
+  coord_equal() +
+  scale_x_continuous(limits = c(-2,2.2)) +
+  scale_y_continuous(limits = c(-2,2.2)) +
+  ggpubr::color_palette(palette = "jco") +  
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  labs(x = "RNA Log2 foldchange", y = "RPF Log2 foldchange") +
+  stat_cor(aes(label = ..rr.label..)) +
+  theme_pubr(legend = "right") +
+  theme(legend.title = element_blank(),
+        legend.text=element_text(size=10))
+hs.tpm.p2
+
+tmp <- hs.tpm %>% 
+  dplyr::select(log2FoldChange.rna, log2FoldChange.rpf,Color.gene) %>%
+  gather(Data, Log2FC, 1:2) %>%
+  mutate(Data = ifelse(Data == "log2FoldChange.rna", "RNA", "RPF"))
+
+hs.tpm.p3 <- ggplot(tmp, aes(x = Log2FC, fill = Color.gene, col = Color.gene)) +
+  geom_density(alpha = 0.6) +
+  scale_x_continuous(limits = c(-2,2.2)) +
+  ggpubr::fill_palette(palette = "jco") +  
+  ggpubr::color_palette(palette = "jco") +  
+  facet_grid(Data~.) +
+  guides(fill = guide_legend(override.aes = list(size = 3)),
+         color = guide_legend(override.aes = list(size = 3))) +
+  labs(x = TeX("Log$_2$ Fold-change")) +
+  theme_pubr(legend = "bottom") +
+  theme(legend.title = element_blank(),
+        legend.text=element_text(size=10))
+hs.tpm.p3
+```
+
+```{r fig.width=8, fig.height=5}
+figS7AB <- ggarrange(hs.tpm.p1, hs.tpm.p3, 
+                     nrow = 1, ncol = 2, labels = c("A", "B"), common.legend = T)
+
+figS7AB
+ggsave(figS7AB, filename = "../plots/FigS7AB.tiff", units="in", dpi=300, compression = "lzw", width = 8, height = 5)
+```
+## Regression of sequence-based features and plots
+```{r}
+features <- read_tsv("../data/human_features.tsv")
+
+reg.data <- left_join(features, meanTPM %>% dplyr::rename(Transcript = tid), "Transcript")
+```
+
+```{r}
+te.reg <- lm(log10(te.NSC) ~ log10(UTR5_Length) + log10(UTR3_Length) + log10(CDS_Length) + UTR5_GC_Content + UTR3_GC_Content + uATG_count + Transcript_FE + Translate_FE + CAI, 
+             data = reg.data %>% filter(is.finite(te.NSC) & !is.na(te.NSC) & te.NSC>0 & RPF.NSC > 1 & RNA.NSC > 1), 
+             na.action = na.omit)
+summary(te.reg)$adj.r.squared
+
+## Model selection
+stepAIC(te.reg, direction = "both")
+
+te.sip.reg <- lm(log10(te.siP) ~ log10(UTR5_Length) + log10(UTR3_Length) + log10(CDS_Length) + UTR5_GC_Content + UTR3_GC_Content + uATG_count + Transcript_FE + Translate_FE + CAI, 
+                 data = reg.data %>% filter(is.finite(te.siP) & !is.na(te.siP) & te.siP>0 & RPF.siP > 1 & RNA.siP > 1), 
+                 na.action = na.omit)
+summary(te.sip.reg)$adj.r.squared
+
+## Model selection
+stepAIC(te.sip.reg, direction = "both")
+
+te.fc.reg <- lm(log2FoldChange.rx ~ log10(UTR5_Length) + log10(UTR3_Length) + log10(CDS_Length) + UTR5_GC_Content + UTR3_GC_Content + uATG_count + Transcript_FE + Translate_FE + CAI, data = reg.data %>% filter(is.finite(log2FoldChange.rx) & !is.na(log2FoldChange.rx) & RPF.NSC > 1 & RNA.NSC > 1), na.action = na.omit)
+summary(te.fc.reg)$adj.r.squared
+
+```
+
+```{r}
+tmp <- tibble(Obs = te.reg$model[,1], Pred = te.reg$fitted.values)
+te.reg.plot <- ggplot(tmp, aes(x = Obs, y = Pred)) +
+  geom_point(size = 0.8, alpha = 0.4) + 
+  geom_smooth(method = "lm") +
+  labs(x = "Observed ribodensity", y = "Predicted ribodensity") +
+  stat_cor(aes(label = ..rr.label..)) +
+  theme_pubr() +
+  theme(aspect.ratio=1)
+te.reg.plot
+
+
+tmp <- tibble(Obs = te.sip.reg$model[,1], Pred = te.sip.reg$fitted.values)
+te.sip.reg.plot <- ggplot(tmp, aes(x = Obs, y = Pred)) +
+  geom_point(size = 0.8, alpha = 0.4) + 
+  geom_smooth(method = "lm") +
+  labs(x = "Observed ribodensity", y = "Predicted ribodensity") +
+  stat_cor(aes(label = ..rr.label..)) +
+  theme_pubr() +
+  theme(aspect.ratio=1)
+te.sip.reg.plot
+
+tmp <- tibble(Obs = te.fc.reg$model[,1], Pred = te.fc.reg$fitted.values)
+te.fc.reg.plot <- ggplot(tmp, aes(x = Obs, y = Pred)) +
+  geom_point(size = 0.8, alpha = 0.4) + 
+  geom_smooth(method = "lm") +
+  labs(x = "Observed ribodensity fold-change", y = "Predicted ribodensity fold-change") +
+  stat_cor(aes(label = ..rr.label..)) +
+  theme_pubr() +
+  theme(aspect.ratio=1)
+te.fc.reg.plot
+```
+
+```{r fig.width=12, fig.height=4}
+figS8 <- ggarrange(te.reg.plot, te.sip.reg.plot, te.fc.reg.plot, 
+                   nrow = 1, ncol = 3, labels = c("A", "B","C"))
+
+figS8
+ggsave(figS8, filename = "../plots/FigS8.tiff", units="in", dpi=300, compression = "lzw", width = 12, height = 4)
+```
+
+## Pauses in specific proteins with multiple TM domains
+```{r}
+dtype <- rep("RPF", 6)
+etype <- rep(c("NSC","siP"),each=3)
+names(dtype) <- datasets[1:6]
+names(etype) <- datasets[1:6]
+libsize <- tibble(data = names(countData[, 5:10]),
+                  libsize = colSums(countData[, 5:10])/1e6)
+
+cds.tbl <- gff %>%
+  as_tibble() %>%
+  filter(type == "CDS") %>% 
+  column_to_rownames(var = "seqnames")
+```
+
+```{r}
+# This has to be done one-by-one
+# "DOLK", "NRM", "SLC7A1", "AMFR", "SLC30A5", "ABCC3"
+gid = "ABCC3"
+gene <- countData %>% filter(gene == gid) %>% pull(tid)
+
+gene_pos_read <- c()
+for(fn in datasets[1:6]){
+  fid <- paste0(filepath,fn,".h5")
+  
+  d <- h5read(fid,paste0("/",gene,"/data/reads/data"))
+  pos15 <- tibble(pos = 16:(ncol(d)+15), acounts = colSums(d[20:21,]))
+  pos16 <- tibble(pos = 17:(ncol(d)+16), acounts = colSums(d[22:24,]))
+  pos17 <- tibble(pos = 18:(ncol(d)+17), acounts = colSums(d[25:26,]))
+  
+  gene_pos_read <- bind_rows(gene_pos_read, list(pos15, pos16, pos17) %>% 
+    purrr::reduce(full_join, by = "pos") %>% 
+    mutate(counts = rowSums(.[,2:4], na.rm = T),
+           data=fn,
+           etype=etype[fn]) %>% 
+    dplyr::select(-c(2,3,4)))
+}
+gene_pos_read <- gene_pos_read %>% 
+  left_join(., libsize, "data") %>%
+  mutate(pos = pos+15) %>%
+  filter(pos >= cds.tbl[gene, "start"] & pos <= cds.tbl[gene, "end"]) %>%
+  mutate(npos = pos-cds.tbl[gene, "start"] +1) %>%
+  split(.$data) %>%
+  map(~mutate(., cod.counts = roll_sum(counts, n = 3, fill = T, align = "left")) %>% 
+        filter(npos %% 3 == 1) %>%
+        mutate(cod.pos = ceiling(npos/3),
+               norm.counts = cod.counts/mean(cod.counts),
+               cpm = cod.counts/libsize) %>%
+        dplyr::select(-c(pos,counts,npos)) %>%
+        mutate(cum.sum = cumsum(norm.counts/sum(norm.counts)))) %>%
+  bind_rows() %>% 
+  group_by(etype, cod.pos) %>%
+  dplyr::summarise(mean.nc = mean(norm.counts),
+                   sd.nc = sd(norm.counts),
+                   mean.cumsum = mean(cum.sum),
+                   sd.cumsum = sd(cum.sum)) %>%
+  ungroup() %>%
+  mutate(etype = factor(etype, levels = c("siP", "NSC")))
+
+```
+
+## Figs. 7 and S13
+```{r}
+g1 <- gene_pos_read %>%
+  dplyr::select(etype, cod.pos, mean.nc) %>%
+  pivot_wider(names_from = etype, values_from = mean.nc)  %>%
+  mutate(roll_siP = roll_mean(siP, n = 15, fill = T, align = "left"),
+         roll_NSC = roll_mean(NSC, n = 15, fill = T, align = "left"),
+         Ratio = roll_siP/roll_NSC)
+
+g <- gene_names_and_transmembrane_number %>%
+  filter(.[1] == gid) %>%
+  dplyr::select(3) %>%
+  pull() %>%
+  strsplit(., " ") %>%
+  unlist() %>%
+  strsplit(., "-") %>%
+  sapply(., rbind) %>%
+  t() %>%
+  as_tibble() %>%
+  type.convert() %>%
+  dplyr::rename(xmin = V1, xmax = V2) %>%
+  mutate(ymin = max(g1$Ratio[is.finite(g1$Ratio)]-1),
+         ymax = max(g1$Ratio[is.finite(g1$Ratio)])+1)
+
+g2 <- gene_pos_read 
+
+fig7 <- ggplot(g2, aes(x = cod.pos, y = mean.nc, col = etype)) +
+  geom_line(alpha = 0.8) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = "Codon position", y = "Normalized reads") +
+  theme_pubr(legend = "none") +
+  theme(legend.title = element_blank()) +
+  geom_line(data = g2, aes(x = cod.pos, y = max(g2$mean.nc)), col = "gray") +
+  geom_rect(data = g, aes(xmin = xmin, xmax = xmax, ymin = max(g2$mean.nc)-1, ymax = max(g2$mean.nc)+1), fill = "gray", inherit.aes = F)
+
+# ggsave(fig7, filename = paste0("../data/test_plots/", gid, "_normalized_reads.tiff"), units="in", dpi=300, compression = "lzw", width = 7, height = 4)
+
+figS13 <- ggplot(g2, aes(x = cod.pos, y = mean.nc, col = etype)) +
+  geom_line(alpha = 0.8) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = "Codon position", y = "Normalized reads") +
+  guides(color = "none") +
+  theme_bw() +
+  theme(legend.title = element_blank()) 
+
+figS13 <- figS13 + 
+  facet_zoom(x = (cod.pos>=40 & cod.pos <=80), zoom.size = 1) 
+
+fig7
+figS13
+
+# ggsave(figS13, filename = paste0("../data/test_plots/", gid, "_zoom_normalized_reads.tiff"), units="in", dpi=300, compression = "lzw", width = 7, height = 4)
+
+```
+
+## Codon-specific analyses
+```{r}
+all_cod_data <- lapply(datasets[1:6], function(fn){
+  fid <- paste0(filepath,fn,".h5")
+  tmp <- mclapply(countData$tid, function(gene) {
+    data <- h5read(fid,paste0("/",gene,"/data/reads/data"))
+    pos15 <- tibble(pos = 16:(ncol(data)+15), counts = colSums(data[20:21,]))
+    pos16 <- tibble(pos = 17:(ncol(data)+16), counts = colSums(data[22:24,]))
+    pos17 <- tibble(pos = 18:(ncol(data)+17), counts = colSums(data[25:26,]))
+  
+    joined_df <- list(pos15, pos16, pos17) %>% 
+      purrr::reduce(full_join, by = "pos") %>% 
+      mutate(totcounts = rowSums(.[,2:4], na.rm = T)) %>% 
+      dplyr::select(-c(2,3,4)) %>%
+      filter(pos >= cds.tbl[gene, "start"] & pos <= cds.tbl[gene, "end"]) %>%
+      mutate(npos = pos-cds.tbl[gene, "start"]+1) %>%
+      mutate(cod.counts = roll_sum(totcounts, n = 3, fill = T, align = "left")) %>% 
+      filter(npos %% 3 == 1) %>%
+      mutate(cod.pos = ceiling(npos/3),
+             norm.counts = cod.counts/mean(cod.counts, na.rm = T)) %>%
+      dplyr::select(cod.pos, cod.counts, norm.counts)
+  }, mc.cores = 40)
+  names(tmp) <- countData$tid 
+  bind_rows(tmp, .id = "transcript")
+  })
+
+names(all_cod_data) <- datasets[1:6] 
+all_cod_data <- bind_rows(all_cod_data, .id = "dataset")
+
+# Read in codon identities
+cod.id <- read_tsv("../data/codon_id.tsv")
+
+all_cod_data <- left_join(all_cod_data, cod.id %>% 
+                            dplyr::rename(transcript = seqnames, 
+                                          cod.pos = codon_position), 
+                          by = c("transcript", "cod.pos"))
+
+write_tsv(all_cod_data, "../data/codon_sp_ribodens.tsv")
+```
+
+
+```{r}
+ribodens <- all_cod_data %>%
+  filter(transcript %in% high_cov$tid) %>%
+  group_by(dataset, codon, amino_acid) %>%
+  dplyr::summarise(mean = mean(norm.counts, na.rm = T),
+                   sd = sd(norm.counts, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(amino_acid = ifelse(codon %in% c("CTG", "TTG"), "L", amino_acid))
+
+pval.ribodens <- ribodens %>%
+  mutate(type = substr(dataset, 5, 7)) %>% 
+  split(.$codon) %>% 
+  map(~t.test(mean ~ type, data = .)$p.value) %>% 
+  enframe() %>% 
+  unnest(cols = c(value)) %>%
+  dplyr::rename(codon = name, pval = value) %>%
+  mutate(sig = ifelse(pval<0.05, "S", "N"))
+
+sumy.ribodens <- ribodens %>%
+  mutate(type = substr(dataset, 5, 7)) %>%
+  group_by(type, amino_acid, codon) %>%
+  dplyr::summarise(mean.ribo = mean(mean),
+                   sd.ribo = sd(mean)) %>%
+  ungroup() %>%
+  mutate(type = factor(type, levels = c("siP", "NSC"))) %>%
+  left_join(., pval.ribodens, by = "codon") %>%
+  filter(!is.na(amino_acid))
+
+```
+
+```{r fig.height=10, fig.width=10}
+fig.cod1 <- sumy.ribodens %>%
+  filter(amino_acid!="*") %>%
+  ggplot(., aes(x = codon, y = mean.ribo, color = type)) +
+  geom_point(position = position_dodge(0.05))  +
+  facet_wrap(~amino_acid, scales = "free") +
+  geom_errorbar(aes(ymin = mean.ribo - sd.ribo, ymax = mean.ribo + sd.ribo), width = .2, position = position_dodge(0.05)) +
+  scale_color_brewer(palette = "Set1") +
+  theme_pubr(legend = "bottom") +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "", y = "Mean normalized ribosome density") 
+
+# ggsave(fig.cod1, filename = paste0(filepath,"test_plots/","codon.ribodens.1.png"), width=10, height=10)
+fig.cod1
+
+```
+
+```{r fig.height=4, fig.width=12}
+fig.cod2 <- sumy.ribodens %>%
+  filter(amino_acid!="*") %>%
+  ggplot(., aes(x = codon, y = mean.ribo, color = type, alpha = sig)) +
+  geom_point(position = position_dodge(0.05))  +
+  geom_errorbar(aes(ymin = mean.ribo - sd.ribo, ymax = mean.ribo + sd.ribo), width = .2, position = position_dodge(0.05)) +
+  scale_color_brewer(palette = "Set1") +
+  scale_alpha_manual(values = c(0.2, 1)) +
+  facet_grid(.~amino_acid, scales = "free_x", space = "free_x") +
+  theme_pubr(legend = "none") +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, size = 10)) +
+  labs(x = "", y = "Mean normalized ribosome density") 
+
+ggsave(fig.cod2, filename = "../plots/FigS9A.tiff", units="in", dpi=300, compression = "lzw", width = 12, height = 4)
+
+fig.cod2
+```
+
+```{r}
+pre.tm.ribodens <- gene_names_and_transmembrane_number %>% 
+  dplyr::select(1,2) %>%
+  dplyr::rename(gene = `Gene symbol`,
+                TM = `TMHMM TM`) %>%
+  left_join(., left_join(high_cov, countData, by = "tid") %>% 
+              dplyr::select(tid, gene), 
+            by = "gene") %>%
+  filter(!is.na(tid)) %>% 
+  dplyr::rename(transcript = tid) %>%
+  left_join(., all_cod_data, by = "transcript") %>%
+  mutate(type = substr(dataset, 5, 7),
+         group = case_when(is.na(TM)|TM==0 ~ "No TMDs",
+                           TM >= 5 ~ ">= 5 TMDs",
+                           TM >= 2 ~ "2 - 4 TMDs",
+                           TM > 0 ~ "1 TMD"),
+         group = factor(group, 
+                        levels = c("No TMDs", "1 TMD", "2 - 4 TMDs", ">= 5 TMDs"))) %>%
+  dplyr::select(-c(gene, TM, transcript, cod.pos, cod.counts)) %>%
+  group_by(group, type, amino_acid, codon, dataset) %>%
+  dplyr::summarise(mean = mean(norm.counts, na.rm = T))%>%
+  ungroup() 
+
+pval.tm.ribodens <- pre.tm.ribodens %>% 
+  split(list(.$group, .$codon)) %>% 
+  map(~t.test(mean ~ type, data = .)$p.value) %>% 
+  enframe() %>% 
+  separate(col = name, into = c("group","codon"),sep = "\\.") %>% 
+  unnest(cols = c(value)) %>%
+  dplyr::rename(pval = value) %>%
+  mutate(sig = ifelse(pval<0.05, "S", "N"))
+
+tm.ribodens <- pre.tm.ribodens %>%
+  group_by(group, type, amino_acid, codon) %>%
+  dplyr::summarise(mean.ribo = mean(mean, na.rm = T),
+                   sd.ribo = sd(mean, na.rm = T)) %>%
+  ungroup() %>%
+  left_join(., pval.tm.ribodens, by = c("group", "codon")) %>%
+  mutate(type = factor(type, levels = c("siP", "NSC")),
+         amino_acid = ifelse(codon %in% c("CTG", "TTG"), "L", amino_acid),
+         group = factor(group, 
+                        levels = c("No TMDs", "1 TMD", "2 - 4 TMDs", ">= 5 TMDs"))) %>%
+  filter(amino_acid != "*")
+```
+
+```{r fig.height=7, fig.width=9}
+fig.cod3 <- tm.ribodens %>%
+  filter(amino_acid!="*") %>%
+  ggplot(., aes(x = codon, y = mean.ribo, color = type, alpha = sig)) +
+  geom_point(position = position_dodge(0.05))  +
+  geom_errorbar(aes(ymin = mean.ribo - sd.ribo, ymax = mean.ribo + sd.ribo), width = .2, position = position_dodge(0.05)) +
+  scale_color_brewer(palette = "Set1") +
+  scale_alpha_manual(values = c(0.2, 1)) +
+  facet_grid(group~amino_acid, scales = "free_x", space = "free_x") +
+  theme_pubr(legend = "none") +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, size = 10)) +
+  labs(x = "", y = "Mean normalized ribosome density") 
+ggsave(fig.cod3, filename = "../plots/FigS9B.tiff", units="in", dpi=300, compression = "lzw", width = 12, height = 10)
+fig.cod3
+```
+
+# Codon-specific RATIOS of ribosome-densities
+```{r}
+rat.ribodens <- sumy.ribodens %>%
+  pivot_wider(names_from = type, values_from = c(mean.ribo, sd.ribo)) %>%
+  filter(!is.na(amino_acid)) %>%
+  mutate(mean.ratio = mean.ribo_siP/mean.ribo_NSC,
+         sd.ratio = mean.ratio*sqrt((sd.ribo_siP/mean.ribo_siP)^2 + (sd.ribo_NSC/mean.ribo_siP)^2),
+         label = paste(amino_acid, codon, sep = "-")) %>%
+  dplyr::select(label, mean.ratio, sd.ratio, everything()) %>%
+  arrange(dplyr::desc(mean.ratio)) %>%
+  mutate(label = factor(label, levels = label),
+         sig = ifelse(sig=="N", "gray50", "red"))
+```
+
+```{r fig.height=4, fig.width=12}
+mycol <- rat.ribodens$sig
+rat.plot1 <- ggplot(rat.ribodens %>% filter(grepl("^[A-Z]",label)), aes(x = label, y = mean.ratio, color = factor(sig))) +
+  geom_point() +
+  geom_pointrange(aes(ymin = mean.ratio-sd.ratio, ymax = mean.ratio+sd.ratio)) +
+  theme_pubr() +
+  scale_color_manual(values= c("gray50", "red")) +
+  guides(color = "none") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.02, colour = mycol)) +
+  labs(x = "", y = "Relative ribosome-densities (siP/NSC)") +
+  geom_hline(yintercept = 1, linetype="dotted")
+
+ggsave(rat.plot1, filename = "../plots/FigS10A.tiff", units = "in", dpi = 300, compression = "lzw", width = 12, height = 4)
+
+rat.plot1
+```
+
+```{r}
+rat.tm.ribodens <- tm.ribodens %>%
+  pivot_wider(names_from = type, values_from = c(mean.ribo, sd.ribo)) %>%
+  filter(!is.na(amino_acid)) %>%
+  mutate(mean.ratio = mean.ribo_siP/mean.ribo_NSC,
+         sd.ratio = mean.ratio*sqrt((sd.ribo_siP/mean.ribo_siP)^2 + (sd.ribo_NSC/mean.ribo_siP)^2),
+         label = paste(amino_acid, codon, sep = "-")) %>%
+  dplyr::select(group, label, mean.ratio, sd.ratio, sig) %>%
+  arrange(dplyr::desc(mean.ratio)) %>%
+  mutate(label = factor(label, levels = levels(rat.ribodens$label)),
+         sig = ifelse(sig=="N", "gray50", "red"),
+         group = factor(group, levels = c("No TMDs", "1 TMD", "2 - 4 TMDs", ">= 5 TMDs")))
+```
+
+```{r fig.height=10, fig.width=10}
+rat.plot2 <- ggplot(rat.tm.ribodens %>% mutate(label = factor(label, levels = levels(rat.ribodens$label))) %>% filter(grepl("^[A-Z]",label)), aes(x = label, y = mean.ratio, color = factor(sig))) +
+  geom_point() +
+  geom_pointrange(aes(ymin = mean.ratio-2*sd.ratio, ymax = mean.ratio+2*sd.ratio)) +
+  theme_pubr() +
+  scale_color_manual(values= c("gray50", "red")) +
+  guides(color = "none") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.02)) +
+  labs(x = "", y = "Relative ribosome-densities (siP/NSC)") +
+  ggplot2::facet_grid(group~., scales = "free_y") +
+  geom_hline(yintercept = 1, linetype="dotted")
+
+ggsave(rat.plot2, filename = "../plots/FigS10B.tiff", units = "in", dpi = 300, compression = "lzw", width = 12, height = 10)
+
+rat.plot2
+
+```
+
+### Metagene plot for ribodens
+```{r}
+meta.codon.plot.data <- all_cod_data %>%
+  filter(transcript %in% high_cov$tid) %>%
+  group_by(dataset, cod.pos) %>%
+  dplyr::summarise(m = mean(norm.counts, na.rm = T)) %>%
+  mutate(roll.m = roll_mean(m, n = 50, fill = T, align = "left"),
+         type = substr(dataset, 5, 7)) %>%
+  ungroup() %>%
+  group_by(type, cod.pos) %>%
+  dplyr::summarise(m = mean(roll.m, na.rm = T),
+                   s = sd(roll.m, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(type = factor(type, levels = c("siP", "NSC")))
+```
+
+```{r}
+metagene.plot <- ggplot(meta.codon.plot.data %>% 
+                  filter(cod.pos <= 250), 
+                aes(x = cod.pos, y = m, fill = type, col = type)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = m - s, ymax = m + s, col = NULL), width = .2, alpha = 0.5) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  theme_pubr(legend = "bottom") +
+  theme(legend.title = element_blank()) +
+  labs(x = "Codon position", y = "Normalized reads (smootheed 50 codons)") 
+
+ggsave(metagene.plot, filename = "../plots/Fig6A.tiff", units = "in", dpi = 300, compression = "lzw", width = 10, height = 8)
+metagene.plot
+```
+
+## Final table
+```{r}
+tableS1 <- left_join(countData, tpmData %>% 
+                       dplyr::select(-c(Length, CDSLength)), 
+                     by = c("tid", "gene"), suffix = c(".count", ".tpm")) %>%
+  dplyr::select(tid, gene, Length, CDSLength, everything()) %>%
+  left_join(., meanTPM %>% 
+              dplyr::select(-Length) %>%
+              mutate(Color.rpf = ifelse(Color.rpf=="#525252", 0, 1),
+                     Color.rna = ifelse(Color.rna=="#525252", 0, 1),
+                     Color.rx = ifelse(Color.rx=="#525252", 0, 1)) %>%
+              dplyr::rename(SigChange.RPF = Color.rpf,
+                     SigChange.RNA = Color.rna,
+                     SigChange.FC = Color.fc,
+                     SigChange.TE.riborex = Color.rx,
+                     RPF.NSC.mean.tpm = RPF.NSC,
+                     RNA.NSC.mean.tpm = RNA.NSC,
+                     RPF.siP.mean.tpm = RPF.siP,
+                     RNA.siP.mean.tpm = RNA.siP),
+            by = c("tid", "gene"))
+
+write_csv(tableS1, "../data/TableS1x.csv")
+```
+
+
+
+
+
+
+
+
+
